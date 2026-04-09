@@ -114,17 +114,27 @@ class GPT(nn.Module):
 # Competition interface — participants must implement this
 # ---------------------------------------------------------------------------
 
+# torch 
 def get_model(config: dict) -> nn.Module:
     """
     Instantiate and return the model from a config dict.
     Called by both train.py (before training) and eval.py (to load a checkpoint).
     """
-    return GPT(
+    # return torch.compile(GPT(
+    #     vocab_size = config.get("vocab_size", 32768),
+    #     seq_len    = config.get("seq_len",    1024),
+    #     n_layer    = config.get("n_layer",    12),
+    #     n_head     = config.get("n_head",     12),
+    #     n_embd     = config.get("n_embd",     768),
+    #     dropout    = config.get("dropout",    0.0),
+    # ))
+
+    return torch.compile(GPT(
         vocab_size = config.get("vocab_size", 32768),
         seq_len    = config.get("seq_len",    1024),
         n_layer    = config.get("n_layer",    12),
         n_head     = config.get("n_head",     12),
         n_embd     = config.get("n_embd",     768),
         dropout    = config.get("dropout",    0.0),
-    )
+    ))
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=fp8-fa4-combined
 #SBATCH --partition=gpus
-#SBATCH --nodes=1
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
@@ -16,7 +16,9 @@ export LD_LIBRARY_PATH=$VENV/cu13/lib:$VENV/cublas/lib:$VENV/cuda_runtime/lib:${
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
 MASTER_PORT=29500
-echo "Master: $MASTER_ADDR | Nodes: $SLURM_NNODES | GPUs: 8"
+echo "Master: $MASTER_ADDR | Nodes: $SLURM_NNODES | GPUs: $((SLURM_NNODES * 8))"
+
+mkdir -p logs
 
 srun python -m torch.distributed.run \
     --nnodes=$SLURM_NNODES \
@@ -36,6 +38,6 @@ srun python -m torch.distributed.run \
         --max_steps     50 \
         --time_limit_min 8 \
         --wandb_project gpumode \
-        --wandb_run_name fp8-fa4-fsdp-4b-8gpu-bs32-seq2048
+        --wandb_run_name fp8-fa4-fsdp-4b-32gpu-4node-bs32-seq2048
 
 echo "=== DONE ==="

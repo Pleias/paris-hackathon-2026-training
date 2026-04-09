@@ -100,7 +100,7 @@ class GPT(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
+        if isinstance(module, nn.Linear) or (_TE_AVAILABLE and isinstance(module, te.Linear)):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -132,21 +132,12 @@ def get_model(config: dict) -> nn.Module:
     Instantiate and return the model from a config dict.
     Called by both train.py (before training) and eval.py (to load a checkpoint).
     """
-    # return torch.compile(GPT(
-    #     vocab_size = config.get("vocab_size", 32768),
-    #     seq_len    = config.get("seq_len",    1024),
-    #     n_layer    = config.get("n_layer",    12),
-    #     n_head     = config.get("n_head",     12),
-    #     n_embd     = config.get("n_embd",     768),
-    #     dropout    = config.get("dropout",    0.0),
-    # ))
-
-    return torch.compile(GPT(
+    return GPT(
         vocab_size = config.get("vocab_size", 32768),
         seq_len    = config.get("seq_len",    1024),
         n_layer    = config.get("n_layer",    12),
         n_head     = config.get("n_head",     12),
         n_embd     = config.get("n_embd",     768),
         dropout    = config.get("dropout",    0.0),
-    ))
+    )
 

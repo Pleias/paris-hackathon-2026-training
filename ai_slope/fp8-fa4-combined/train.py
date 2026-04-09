@@ -16,8 +16,8 @@ from dataclasses import dataclass, asdict
 
 import numpy as np
 import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, StateDictType, FullStateDictConfig, BackwardPrefetch, MixedPrecision
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import functools
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -28,7 +28,7 @@ except ImportError:
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 
-from model import get_model
+from model import get_model, Block
 
 try:
     import transformer_engine.pytorch as te
@@ -143,14 +143,23 @@ def get_lr(step: int, cfg: Config) -> float:
 # Checkpoint
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, step: int, cfg: Config):
-    raw_model = model.module if hasattr(model, "module") else model
-    torch.save({
-        "step":   step,
-        "model":  raw_model.state_dict(),
-        "config": asdict(cfg),
-    }, cfg.checkpoint_path)
-    print(f"[ckpt] saved → {cfg.checkpoint_path}  (step {step})")
+def save_checkpoint(model, step: int, cfg: Config, master: bool):
+    # Unwrap torch.compile's OptimizedModule if present
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    if isinstance(inner, FSDP):
+        full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(inner, StateDictType.FULL_STATE_DICT, full_cfg):
+            state_dict = inner.state_dict()
+    else:
+        raw_model = inner.module if hasattr(inner, "module") else inner
+        state_dict = raw_model.state_dict()
+    if master:
+        torch.save({
+            "step":   step,
+            "model":  state_dict,
+            "config": asdict(cfg),
+        }, cfg.checkpoint_path)
+        print(f"[ckpt] saved → {cfg.checkpoint_path}  (step {step})")
 
 
 def get_memory_stats(device: str) -> dict:
@@ -315,6 +324,7 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     torch.manual_seed(1337 + rank)
+    np.random.seed(1337 + rank)
     amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) \
               if "cuda" in device else nullcontext()
     attn_ctx_factory = setup_attention_backend(device=device, master=master, require_fa4=args.require_fa4)
@@ -343,28 +353,40 @@ def main():
             )
             wandb.run.summary["n_params"] = n_params
 
+    # ------------------------------------------------------------------ Optimizer param groups (before FSDP)
+    decay_params   = [p for n, p in model.named_parameters()
+                      if p.requires_grad and p.dim() >= 2]
+    nodecay_params = [p for n, p in model.named_parameters()
+                      if p.requires_grad and p.dim() < 2]
+
     if ddp:
         wrap_policy = functools.partial(
-            size_based_auto_wrap_policy, min_num_params=1_000_000
+            transformer_auto_wrap_policy, transformer_layer_cls={Block}
+        )
+        mp = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.bfloat16,
         )
         model = FSDP(
             model,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             auto_wrap_policy=wrap_policy,
             device_id=local_rank,
-            mixed_precision=None,  # FP8 handled by TE, not FSDP
+            mixed_precision=mp,
+            use_orig_params=True,
+            forward_prefetch=True,
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            limit_all_gathers=True,
         )
         if master:
             print("[fsdp] FULL_SHARD enabled — optimizer/grad/param sharded across 8 GPUs")
     else:
         model = model.to(device)
 
-    # ------------------------------------------------------------------ Optimizer
-    raw_model      = model.module if (ddp and hasattr(model, "module")) else model
-    decay_params   = [p for n, p in model.named_parameters()
-                      if p.requires_grad and p.dim() >= 2]
-    nodecay_params = [p for n, p in model.named_parameters()
-                      if p.requires_grad and p.dim() < 2]
+    # Apply torch.compile after FSDP wrapping
+    model = torch.compile(model)
+
     optimizer = torch.optim.AdamW(
         [{"params": decay_params,   "weight_decay": cfg.weight_decay},
          {"params": nodecay_params, "weight_decay": 0.0}],
@@ -398,7 +420,7 @@ def main():
         if stop.item():
             if master:
                 print(f"\n[time] {elapsed/60:.1f} min elapsed — time limit reached.")
-                save_checkpoint(model, step, cfg)
+            save_checkpoint(model, step, cfg, master)
             stop_reason = "time_limit"
             break
 
@@ -430,7 +452,12 @@ def main():
 
         t_opt = time.time()
         if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            if ddp:
+                # FSDP's built-in clip computes global gradient norm across all shards
+                fsdp_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                fsdp_model.clip_grad_norm_(cfg.grad_clip)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         compute_time += time.time() - t_opt
@@ -502,9 +529,10 @@ def main():
                   f"time left {remaining/60:.1f}m")
 
     # max_steps reached cleanly
-    if step >= cfg.max_steps and master:
-        print(f"\n[done] Reached max_steps={cfg.max_steps}.")
-        save_checkpoint(model, step, cfg)
+    if step >= cfg.max_steps:
+        if master:
+            print(f"\n[done] Reached max_steps={cfg.max_steps}.")
+        save_checkpoint(model, step, cfg, master)
 
     if master:
         elapsed_total = time.time() - train_start

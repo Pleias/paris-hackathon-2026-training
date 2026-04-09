@@ -2,11 +2,14 @@
 --index-url https://download.pytorch.org/whl/nightly/cu130
 torch>=2.7.0.dev0
 
-# Megatron-Core for tensor parallelism primitives
-megatron-core>=0.9.0
+# Megatron-Core for tensor parallelism primitives (not on PyPI, install from GitHub)
+megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@main#subdirectory=megatron/core
 
 # Transformer Engine for FP8 on Blackwell B300
 transformer-engine[pytorch]>=1.12.0
 
 # Numerics / data
 numpy>=1.26.0
+
+# Testing (optional, not needed for training)
+pytest>=8.0.0

@@ -6,6 +6,8 @@ import os
 import time
 import glob
 import math
+import csv
+import json
 import argparse
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
@@ -109,6 +111,60 @@ def save_checkpoint(model, step: int, cfg: Config):
     print(f"[ckpt] saved → {cfg.checkpoint_path}  (step {step})")
 
 
+def get_memory_stats(device: str) -> dict:
+    if "cuda" not in device or not torch.cuda.is_available():
+        return {
+            "mem_allocated_gib": 0.0,
+            "mem_reserved_gib": 0.0,
+            "mem_peak_allocated_gib": 0.0,
+            "mem_peak_reserved_gib": 0.0,
+        }
+
+    gib = 1024 ** 3
+    return {
+        "mem_allocated_gib": torch.cuda.memory_allocated() / gib,
+        "mem_reserved_gib": torch.cuda.memory_reserved() / gib,
+        "mem_peak_allocated_gib": torch.cuda.max_memory_allocated() / gib,
+        "mem_peak_reserved_gib": torch.cuda.max_memory_reserved() / gib,
+    }
+
+
+def save_metrics_reports(cfg: Config, records: list[dict], summary: dict):
+    base, _ = os.path.splitext(cfg.checkpoint_path)
+    json_path = f"{base}_metrics.json"
+    csv_path = f"{base}_metrics.csv"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"summary": summary, "records": records}, f, indent=2)
+
+    fields = [
+        "step",
+        "loss",
+        "lr",
+        "step_time_sec",
+        "data_time_sec",
+        "compute_time_sec",
+        "compute_usage_pct",
+        "tokens_this_step",
+        "tokens_total",
+        "tokens_per_sec",
+        "mem_allocated_gib",
+        "mem_reserved_gib",
+        "mem_peak_allocated_gib",
+        "mem_peak_reserved_gib",
+        "elapsed_minutes",
+        "remaining_minutes",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in records:
+            writer.writerow(row)
+
+    print(f"[metrics] saved → {json_path}")
+    print(f"[metrics] saved → {csv_path}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -188,6 +244,10 @@ def main():
     train_start = time.time()
     model.train()
     optimizer.zero_grad()
+    world_size = dist.get_world_size() if ddp else 1
+    total_tokens = 0
+    metrics_records = []
+    stop_reason = "max_steps"
 
     while step < cfg.max_steps:
 
@@ -200,37 +260,81 @@ def main():
             if master:
                 print(f"\n[time] {elapsed/60:.1f} min elapsed — time limit reached.")
                 save_checkpoint(model, step, cfg)
+            stop_reason = "time_limit"
             break
 
         step_start = time.time()
+        data_time = 0.0
+        compute_time = 0.0
+        if "cuda" in device:
+            torch.cuda.reset_peak_memory_stats()
         for pg in optimizer.param_groups:
             pg["lr"] = get_lr(step, cfg)
 
         # Gradient accumulation
         accumulated_loss = 0.0
         for micro_step in range(cfg.grad_accum_steps):
+            t_data = time.time()
             x, y     = dataset.get_batch(cfg.batch_size, device)
+            data_time += time.time() - t_data
+
             sync_ctx = model.no_sync() if (ddp and micro_step < cfg.grad_accum_steps - 1) \
                        else nullcontext()
+            t_compute = time.time()
             with sync_ctx, amp_ctx:
                 _, loss = model(x, y)
                 loss    = loss / cfg.grad_accum_steps
             loss.backward()
+            compute_time += time.time() - t_compute
             accumulated_loss += loss.item()
 
+        t_opt = time.time()
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        compute_time += time.time() - t_opt
 
         step += 1
+        step_time = time.time() - step_start
+        tokens_this_step = cfg.batch_size * cfg.grad_accum_steps * cfg.seq_len * world_size
+        total_tokens += tokens_this_step
+        tokens_per_sec = tokens_this_step / max(step_time, 1e-9)
+        compute_usage_pct = 100.0 * compute_time / max(step_time, 1e-9)
+        mem_stats = get_memory_stats(device)
+
+        if master:
+            elapsed_total = time.time() - train_start
+            remaining = max(0, cfg.time_limit_seconds - elapsed_total)
+            metrics_records.append({
+                "step": step,
+                "loss": accumulated_loss,
+                "lr": get_lr(step, cfg),
+                "step_time_sec": step_time,
+                "data_time_sec": data_time,
+                "compute_time_sec": compute_time,
+                "compute_usage_pct": compute_usage_pct,
+                "tokens_this_step": tokens_this_step,
+                "tokens_total": total_tokens,
+                "tokens_per_sec": tokens_per_sec,
+                "mem_allocated_gib": mem_stats["mem_allocated_gib"],
+                "mem_reserved_gib": mem_stats["mem_reserved_gib"],
+                "mem_peak_allocated_gib": mem_stats["mem_peak_allocated_gib"],
+                "mem_peak_reserved_gib": mem_stats["mem_peak_reserved_gib"],
+                "elapsed_minutes": elapsed_total / 60.0,
+                "remaining_minutes": remaining / 60.0,
+            })
 
         if master and step % 10 == 0:
             elapsed_total = time.time() - train_start
             remaining     = max(0, cfg.time_limit_seconds - elapsed_total)
             print(f"step {step:6d} | loss {accumulated_loss:.4f} | "
                   f"lr {get_lr(step, cfg):.2e} | "
-                  f"{(time.time()-step_start)*1000:.0f}ms/step | "
+                  f"{step_time*1000:.0f}ms/step | "
+                  f"tok/s {tokens_per_sec:,.0f} | "
+                  f"tok total {total_tokens:,} | "
+                  f"compute {compute_usage_pct:5.1f}% | "
+                  f"mem {mem_stats['mem_peak_reserved_gib']:.2f}GiB peak | "
                   f"elapsed {elapsed_total/60:.1f}m | "
                   f"time left {remaining/60:.1f}m")
 
@@ -238,6 +342,33 @@ def main():
     if step >= cfg.max_steps and master:
         print(f"\n[done] Reached max_steps={cfg.max_steps}.")
         save_checkpoint(model, step, cfg)
+
+    if master:
+        elapsed_total = time.time() - train_start
+        if metrics_records:
+            avg_tokens_per_sec = sum(r["tokens_per_sec"] for r in metrics_records) / len(metrics_records)
+            avg_compute_usage = sum(r["compute_usage_pct"] for r in metrics_records) / len(metrics_records)
+            peak_mem_reserved = max(r["mem_peak_reserved_gib"] for r in metrics_records)
+            final_loss = metrics_records[-1]["loss"]
+        else:
+            avg_tokens_per_sec = 0.0
+            avg_compute_usage = 0.0
+            peak_mem_reserved = 0.0
+            final_loss = None
+
+        summary = {
+            "stop_reason": stop_reason,
+            "steps_completed": step,
+            "elapsed_seconds": elapsed_total,
+            "tokens_total": total_tokens,
+            "tokens_per_sec_avg": avg_tokens_per_sec,
+            "compute_usage_pct_avg": avg_compute_usage,
+            "mem_peak_reserved_gib_max": peak_mem_reserved,
+            "final_loss": final_loss,
+            "world_size": world_size,
+            "config": asdict(cfg),
+        }
+        save_metrics_reports(cfg, metrics_records, summary)
 
     if ddp:
         destroy_process_group()

@@ -16,7 +16,9 @@ from dataclasses import dataclass, asdict
 
 import numpy as np
 import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+import functools
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 try:
@@ -328,7 +330,8 @@ def main():
             print("[fp8] TE not available, running in bfloat16 only")
 
     # ------------------------------------------------------------------ Model
-    model = get_model(asdict(cfg)).to(device)
+    # Create on CPU first — FSDP handles device placement via device_id
+    model = get_model(asdict(cfg))
     if master:
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[model] {n_params/1e6:.1f}M parameters")
@@ -341,13 +344,26 @@ def main():
             wandb.run.summary["n_params"] = n_params
 
     if ddp:
-        model = DDP(model, device_ids=[local_rank])
+        wrap_policy = functools.partial(
+            size_based_auto_wrap_policy, min_num_params=1_000_000
+        )
+        model = FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=wrap_policy,
+            device_id=local_rank,
+            mixed_precision=None,  # FP8 handled by TE, not FSDP
+        )
+        if master:
+            print("[fsdp] FULL_SHARD enabled — optimizer/grad/param sharded across 8 GPUs")
+    else:
+        model = model.to(device)
 
     # ------------------------------------------------------------------ Optimizer
-    raw_model      = model.module if ddp else model
-    decay_params   = [p for n, p in raw_model.named_parameters()
+    raw_model      = model.module if (ddp and hasattr(model, "module")) else model
+    decay_params   = [p for n, p in model.named_parameters()
                       if p.requires_grad and p.dim() >= 2]
-    nodecay_params = [p for n, p in raw_model.named_parameters()
+    nodecay_params = [p for n, p in model.named_parameters()
                       if p.requires_grad and p.dim() < 2]
     optimizer = torch.optim.AdamW(
         [{"params": decay_params,   "weight_decay": cfg.weight_decay},
@@ -401,7 +417,8 @@ def main():
             x, y     = dataset.get_batch(cfg.batch_size, device)
             data_time += time.time() - t_data
 
-            sync_ctx = model.no_sync() if (ddp and micro_step < cfg.grad_accum_steps - 1) \
+            sync_ctx = model.no_sync() if (ddp and hasattr(model, "no_sync")
+                                           and micro_step < cfg.grad_accum_steps - 1) \
                        else nullcontext()
             t_compute = time.time()
             with sync_ctx, amp_ctx, fp8_ctx_factory(), attn_ctx_factory():

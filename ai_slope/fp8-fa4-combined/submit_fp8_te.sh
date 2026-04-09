@@ -36,6 +36,6 @@ srun python -m torch.distributed.run \
         --max_steps     50 \
         --time_limit_min 8 \
         --wandb_project gpumode \
-        --wandb_run_name fp8-fa4-combined-4b-8gpu-bs32-seq2048
+        --wandb_run_name fp8-fa4-fsdp-4b-8gpu-bs32-seq2048
 
 echo "=== DONE ==="

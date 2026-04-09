@@ -1,3 +1,5 @@
 .venv/
 *.err
 *.out
+__pycache__
+*.pt

@@ -35,6 +35,8 @@ dict you saved — use it to store the hyperparameters needed to reconstruct you
 - **10 minutes of GPU time**, counted from the first forward pass to last forward pass (i.e., finishing the step-inflight is fine (if this is a few seconds), staring a new one is not)
 - SLURM wall time is **12 minutes** to allow for NCCL init and checkpoint saving
 
+### yarik remark: 
+- eval set is 1024 seq_len
 ---
 
 ## Starter Code

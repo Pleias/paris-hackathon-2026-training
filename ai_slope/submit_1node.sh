@@ -20,9 +20,6 @@ export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
 export MASTER_PORT=29500
 
 # NCCL tuning
-export NCCL_IB_DISABLE=0
-export NCCL_IB_GID_INDEX=3
-export NCCL_SOCKET_IFNAME=ib0
 export NCCL_DEBUG=WARN
 export NCCL_ASYNC_ERROR_HANDLING=1
 

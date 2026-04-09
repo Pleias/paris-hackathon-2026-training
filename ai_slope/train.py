@@ -182,7 +182,7 @@ class TPAttention(nn.Module):
         )
         self.linear_proj = RowParallelLinear(
             self.n_heads * self.head_dim, cfg.hidden_size,
-            bias=False, input_is_parallel=True,
+            bias=False, input_is_parallel=True, skip_bias_add=False,
             config=mp_config, init_method=init_method,
         )
 
@@ -242,7 +242,7 @@ class TPFeedForward(nn.Module):
         # Down projection (RowParallel)
         self.linear_fc2 = RowParallelLinear(
             cfg.intermediate_size, cfg.hidden_size,
-            bias=False, input_is_parallel=True,
+            bias=False, input_is_parallel=True, skip_bias_add=False,
             config=mp_config, init_method=init_method,
         )
 
@@ -618,6 +618,8 @@ def main():
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
     )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    model_parallel_cuda_manual_seed(1337)
 
     tp_rank  = get_tensor_model_parallel_rank()
     dp_rank  = get_data_parallel_rank()
@@ -712,7 +714,7 @@ def main():
     if cfg.use_fp8:
         fp8_recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16)
         def get_amp_ctx():
-            return te.fp8_autocast(enabled=True, recipe=fp8_recipe)
+            return te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
     else:
         def get_amp_ctx():
             return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)

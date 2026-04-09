@@ -1,35 +1,155 @@
 """
-TorchTitan-based variant of the starter training script.
+TorchTitan-based variant of the starter training script using Qwen3 ~0.8B.
 
-This keeps the same checkpoint contract as train.py:
-checkpoint.pt contains {"step", "model", "config"} and can be loaded by model.py.
+Checkpoint contract: checkpoint.pt contains {"step", "model", "config"}.
 """
 
 import os
 import time
 import glob
-import csv
 import json
 import argparse
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
+from functools import partial
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 
-from model import get_model
-
 try:
     from torchtitan.components.optimizer import OptimizersContainer
     from torchtitan.components.lr_scheduler import LRSchedulersContainer
+    from torchtitan.models.common import Embedding, Linear, RoPE
+    from torchtitan.models.common.attention import ScaledDotProductAttention
+    from torchtitan.models.common.config_utils import make_ffn_config, make_gqa_config
+    from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
+    from torchtitan.models.common.rmsnorm import RMSNorm
 except ImportError as exc:
     raise ImportError(
         "TorchTitan is not installed. Install from source, e.g. "
         "pip install git+https://github.com/pytorch/torchtitan.git"
     ) from exc
+
+from qwen import Qwen3Model, Qwen3TransformerBlock
+
+
+# ---------------------------------------------------------------------------
+# Qwen3 ~0.8B model builder
+# ---------------------------------------------------------------------------
+
+_EPS = 1e-6
+_LINEAR_INIT = {"weight": partial(nn.init.trunc_normal_, std=0.02), "bias": nn.init.zeros_}
+_NORM_INIT = {"weight": nn.init.ones_}
+_EMBEDDING_SKIP_INIT = {"weight": skip_param_init}
+
+
+def _output_init(dim: int) -> dict:
+    s = dim ** -0.5
+    return {"weight": partial(nn.init.trunc_normal_, std=s, a=-3 * s, b=3 * s)}
+
+
+def _depth_init(layer_id: int) -> dict:
+    return {"weight": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id))}
+
+
+def _norm(dim: int) -> RMSNorm.Config:
+    return RMSNorm.Config(normalized_shape=dim, eps=_EPS, param_init=_NORM_INIT)
+
+
+def build_qwen3_0_8b(vocab_size: int, seq_len: int) -> Qwen3Model:
+    """Qwen3-style dense model targeting ~0.8B parameters.
+
+    Architecture (matches Qwen3 family conventions):
+      dim=1280, n_layers=32, n_heads=16, n_kv_heads=8, head_dim=128, hidden_dim=4096
+    Parameter count (with weight tying):
+      32 × (attention ~7.9M + FFN ~15.7M) + embeddings (~vocab×1280) ≈ 0.80B @ vocab=32768
+    """
+    dim = 1280
+    head_dim = 128
+    n_heads = 16
+    n_kv_heads = 8
+    hidden_dim = 4096
+    n_layers = 32
+
+    layers = []
+    for layer_id in range(n_layers):
+        layers.append(
+            Qwen3TransformerBlock.Config(
+                attention_norm=_norm(dim),
+                ffn_norm=_norm(dim),
+                attention=make_gqa_config(
+                    dim=dim,
+                    n_heads=n_heads,
+                    n_kv_heads=n_kv_heads,
+                    head_dim=head_dim,
+                    wqkv_param_init=_LINEAR_INIT,
+                    wo_param_init=_depth_init(layer_id),
+                    inner_attention=ScaledDotProductAttention.Config(),
+                    mask_type="causal",
+                    rope_backend="cos_sin",
+                    q_norm=_norm(head_dim),
+                    k_norm=_norm(head_dim),
+                ),
+                feed_forward=make_ffn_config(
+                    dim=dim,
+                    hidden_dim=hidden_dim,
+                    w1_param_init=_LINEAR_INIT,
+                    w2w3_param_init=_depth_init(layer_id),
+                ),
+            )
+        )
+
+    config = Qwen3Model.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        enable_weight_tying=True,
+        norm=_norm(dim),
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_SKIP_INIT,
+        ),
+        output=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_init(dim),
+        ),
+        rope=RoPE.Config(
+            dim=head_dim,
+            max_seq_len=seq_len,
+            theta=1_000_000.0,
+            backend="cos_sin",
+        ),
+        layers=layers,
+    )
+    model = Qwen3Model(config)
+    model.init_states()
+    return model
+
+
+class Qwen3LM(nn.Module):
+    """Thin wrapper giving Qwen3Model the (idx, targets) -> (logits, loss) interface."""
+
+    def __init__(self, vocab_size: int, seq_len: int):
+        super().__init__()
+        self.model = build_qwen3_0_8b(vocab_size, seq_len)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        logits = self.model(idx)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
 
 # ---------------------------------------------------------------------------
@@ -43,12 +163,8 @@ class Config:
     token_dtype: str = "uint16"
     seq_len: int = 1024
 
-    # Model (passed through to get_model)
+    # Model — architecture is fixed at Qwen3 ~0.8B; only vocab_size is configurable
     vocab_size: int = 32768
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
 
     # Training
     batch_size: int = 8
@@ -130,40 +246,50 @@ def get_memory_stats(device: str) -> dict:
     }
 
 
-def save_metrics_reports(cfg: Config, records: list[dict], summary: dict):
+def aggregate_distributed_metrics(ddp: bool, device: str, metrics: dict[str, float]) -> dict[str, float]:
+    """Aggregate per-rank scalars into world average and world max metrics."""
+    if not ddp:
+        out = dict(metrics)
+        for key, value in metrics.items():
+            out[f"{key}_max"] = value
+        return out
+
+    keys = list(metrics.keys())
+    values = torch.tensor([float(metrics[k]) for k in keys], device=device, dtype=torch.float32)
+    sum_values = values.clone()
+    max_values = values.clone()
+
+    dist.all_reduce(sum_values, op=dist.ReduceOp.SUM)
+    dist.all_reduce(max_values, op=dist.ReduceOp.MAX)
+
+    world_size = dist.get_world_size()
+    out = {}
+    for i, key in enumerate(keys):
+        out[key] = (sum_values[i] / world_size).item()
+        out[f"{key}_max"] = max_values[i].item()
+    return out
+
+
+def _next_available_path(path: str) -> str:
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    idx = 1
+    while True:
+        candidate = f"{base}_{idx}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
+
+
+def save_metrics_reports(cfg: Config, summary: dict):
     base, _ = os.path.splitext(cfg.checkpoint_path)
-    json_path = f"{base}_metrics.json"
-    csv_path = f"{base}_metrics.csv"
+    json_path = _next_available_path(f"{base}_summary.json")
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({"summary": summary, "records": records}, f, indent=2)
-
-    fields = [
-        "step",
-        "loss",
-        "lr",
-        "step_time_sec",
-        "data_time_sec",
-        "compute_time_sec",
-        "compute_usage_pct",
-        "tokens_this_step",
-        "tokens_total",
-        "tokens_per_sec",
-        "mem_allocated_gib",
-        "mem_reserved_gib",
-        "mem_peak_allocated_gib",
-        "mem_peak_reserved_gib",
-        "elapsed_minutes",
-        "remaining_minutes",
-    ]
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for row in records:
-            writer.writerow(row)
+    with open(json_path, "x", encoding="utf-8") as f:
+        json.dump({"summary": summary}, f, indent=2)
 
     print(f"[metrics] saved -> {json_path}")
-    print(f"[metrics] saved -> {csv_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -176,13 +302,12 @@ def main():
     parser.add_argument("--checkpoint_path", default="checkpoint.pt")
     parser.add_argument("--seq_len", type=int, default=1024)
     parser.add_argument("--vocab_size", type=int, default=32768)
-    parser.add_argument("--n_layer", type=int, default=12)
-    parser.add_argument("--n_head", type=int, default=12)
-    parser.add_argument("--n_embd", type=int, default=768)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
     parser.add_argument("--max_steps", type=int, default=10_000)
     parser.add_argument("--time_limit_min", type=float, default=10.0)
+    parser.add_argument("--wandb_project", type=str, default=None, help="W&B project name (omit to disable)")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name")
     args = parser.parse_args()
 
     cfg = Config(
@@ -190,9 +315,6 @@ def main():
         checkpoint_path=args.checkpoint_path,
         seq_len=args.seq_len,
         vocab_size=args.vocab_size,
-        n_layer=args.n_layer,
-        n_head=args.n_head,
-        n_embd=args.n_embd,
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
         max_steps=args.max_steps,
@@ -221,10 +343,17 @@ def main():
     )
 
     # ------------------------------------------------------------------ Model
-    model = get_model(asdict(cfg)).to(device)
+    model = Qwen3LM(cfg.vocab_size, cfg.seq_len).to(device)
     if master:
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[model] {n_params/1e6:.1f}M parameters")
+        if wandb is not None and args.wandb_project:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config=asdict(cfg),
+            )
+            wandb.run.summary["n_params"] = n_params
 
     if ddp:
         model = DDP(model, device_ids=[local_rank])
@@ -263,7 +392,11 @@ def main():
     optimizers.zero_grad()
     world_size = dist.get_world_size() if ddp else 1
     total_tokens = 0
-    metrics_records = []
+    metrics_count = 0
+    tokens_per_sec_sum = 0.0
+    compute_usage_sum = 0.0
+    peak_mem_reserved = 0.0
+    final_loss = None
     stop_reason = "max_steps"
 
     while step < cfg.max_steps:
@@ -316,31 +449,54 @@ def main():
         tokens_this_step = cfg.batch_size * cfg.grad_accum_steps * cfg.seq_len * world_size
         total_tokens += tokens_this_step
         tokens_per_sec = tokens_this_step / max(step_time, 1e-9)
-        compute_usage_pct = 100.0 * compute_time / max(step_time, 1e-9)
-        mem_stats = get_memory_stats(device)
+        compute_usage_pct_local = 100.0 * compute_time / max(step_time, 1e-9)
+        mem_stats_local = get_memory_stats(device)
+        aggregated = aggregate_distributed_metrics(
+            ddp=ddp,
+            device=device,
+            metrics={
+                "compute_usage_pct": compute_usage_pct_local,
+                "mem_allocated_gib": mem_stats_local["mem_allocated_gib"],
+                "mem_reserved_gib": mem_stats_local["mem_reserved_gib"],
+                "mem_peak_allocated_gib": mem_stats_local["mem_peak_allocated_gib"],
+                "mem_peak_reserved_gib": mem_stats_local["mem_peak_reserved_gib"],
+            },
+        )
 
         if master:
             elapsed_total = time.time() - train_start
             remaining = max(0.0, cfg.time_limit_seconds - elapsed_total)
             current_lr = optimizers.optimizers[0].param_groups[0]["lr"]
-            metrics_records.append({
+            step_metrics = {
                 "step": step,
                 "loss": accumulated_loss,
                 "lr": current_lr,
                 "step_time_sec": step_time,
                 "data_time_sec": data_time,
                 "compute_time_sec": compute_time,
-                "compute_usage_pct": compute_usage_pct,
+                "compute_usage_pct": aggregated["compute_usage_pct"],
                 "tokens_this_step": tokens_this_step,
                 "tokens_total": total_tokens,
                 "tokens_per_sec": tokens_per_sec,
-                "mem_allocated_gib": mem_stats["mem_allocated_gib"],
-                "mem_reserved_gib": mem_stats["mem_reserved_gib"],
-                "mem_peak_allocated_gib": mem_stats["mem_peak_allocated_gib"],
-                "mem_peak_reserved_gib": mem_stats["mem_peak_reserved_gib"],
+                "mem_allocated_gib": aggregated["mem_allocated_gib"],
+                "mem_allocated_gib_max": aggregated["mem_allocated_gib_max"],
+                "mem_reserved_gib": aggregated["mem_reserved_gib"],
+                "mem_reserved_gib_max": aggregated["mem_reserved_gib_max"],
+                "mem_peak_allocated_gib": aggregated["mem_peak_allocated_gib"],
+                "mem_peak_allocated_gib_max": aggregated["mem_peak_allocated_gib_max"],
+                "mem_peak_reserved_gib": aggregated["mem_peak_reserved_gib"],
+                "mem_peak_reserved_gib_max": aggregated["mem_peak_reserved_gib_max"],
                 "elapsed_minutes": elapsed_total / 60.0,
                 "remaining_minutes": remaining / 60.0,
-            })
+            }
+            metrics_count += 1
+            tokens_per_sec_sum += step_metrics["tokens_per_sec"]
+            compute_usage_sum += step_metrics["compute_usage_pct"]
+            peak_mem_reserved = max(peak_mem_reserved, step_metrics["mem_peak_reserved_gib_max"])
+            final_loss = step_metrics["loss"]
+
+        if master and wandb is not None and wandb.run is not None:
+            wandb.log(step_metrics, step=step)
 
         if master and step % 10 == 0:
             elapsed_total = time.time() - train_start
@@ -352,8 +508,8 @@ def main():
                 f"{step_time*1000:.0f}ms/step | "
                 f"tok/s {tokens_per_sec:,.0f} | "
                 f"tok total {total_tokens:,} | "
-                f"compute {compute_usage_pct:5.1f}% | "
-                f"mem {mem_stats['mem_peak_reserved_gib']:.2f}GiB peak | "
+                f"compute avg/max {aggregated['compute_usage_pct']:5.1f}%/{aggregated['compute_usage_pct_max']:5.1f}% | "
+                f"mem peak avg/max {aggregated['mem_peak_reserved_gib']:.2f}/{aggregated['mem_peak_reserved_gib_max']:.2f}GiB | "
                 f"elapsed {elapsed_total/60:.1f}m | "
                 f"time left {remaining/60:.1f}m"
             )
@@ -364,11 +520,9 @@ def main():
 
     if master:
         elapsed_total = time.time() - train_start
-        if metrics_records:
-            avg_tokens_per_sec = sum(r["tokens_per_sec"] for r in metrics_records) / len(metrics_records)
-            avg_compute_usage = sum(r["compute_usage_pct"] for r in metrics_records) / len(metrics_records)
-            peak_mem_reserved = max(r["mem_peak_reserved_gib"] for r in metrics_records)
-            final_loss = metrics_records[-1]["loss"]
+        if metrics_count > 0:
+            avg_tokens_per_sec = tokens_per_sec_sum / metrics_count
+            avg_compute_usage = compute_usage_sum / metrics_count
         else:
             avg_tokens_per_sec = 0.0
             avg_compute_usage = 0.0
@@ -387,7 +541,10 @@ def main():
             "world_size": world_size,
             "config": asdict(cfg),
         }
-        save_metrics_reports(cfg, metrics_records, summary)
+        save_metrics_reports(cfg, summary)
+        if wandb is not None and wandb.run is not None:
+            wandb.run.summary.update(summary)
+            wandb.finish()
 
     if ddp:
         destroy_process_group()

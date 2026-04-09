@@ -1,0 +1,33 @@
+{
+  "summary": {
+    "stop_reason": "time_limit",
+    "steps_completed": 667,
+    "elapsed_seconds": 122.01811099052429,
+    "tokens_total": 174850048,
+    "tokens_per_sec_avg": 1785093.073229787,
+    "compute_usage_pct_avg": 21.855720664428986,
+    "mem_peak_reserved_gib_max": 6.865234375,
+    "final_loss": 4.86784553527832,
+    "world_size": 8,
+    "config": {
+      "data_dir": "/home/data/",
+      "token_dtype": "uint16",
+      "seq_len": 1024,
+      "vocab_size": 32768,
+      "n_layer": 12,
+      "n_head": 12,
+      "n_embd": 768,
+      "dropout": 0.0,
+      "batch_size": 8,
+      "grad_accum_steps": 4,
+      "max_lr": 0.0006,
+      "min_lr": 6e-05,
+      "warmup_steps": 100,
+      "max_steps": 1000000,
+      "weight_decay": 0.1,
+      "grad_clip": 1.0,
+      "time_limit_seconds": 120.0,
+      "checkpoint_path": "experiments/model_scale_20260409_131633/m110.pt"
+    }
+  }
+}

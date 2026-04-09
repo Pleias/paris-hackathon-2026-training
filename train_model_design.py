@@ -1,5 +1,5 @@
 """
-Starter training script for the gpu-mode Paris hackathon training track
+Training script for the gpu-mode Paris hackathon training track — Qwen3 ~0.8B variant.
 """
 
 import os
@@ -10,9 +10,12 @@ import json
 import argparse
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
+from functools import partial
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
@@ -22,7 +25,128 @@ except ImportError:
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 
-from model import get_model
+try:
+    from torchtitan.models.common import Embedding, Linear, RoPE
+    from torchtitan.models.common.attention import ScaledDotProductAttention
+    from torchtitan.models.common.config_utils import make_ffn_config, make_gqa_config
+    from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
+    from torchtitan.models.common.rmsnorm import RMSNorm
+except ImportError as exc:
+    raise ImportError(
+        "TorchTitan is not installed. Install from source, e.g. "
+        "pip install git+https://github.com/pytorch/torchtitan.git"
+    ) from exc
+
+from qwen_ours import Qwen3Model, Qwen3TransformerBlock
+
+
+# ---------------------------------------------------------------------------
+# Qwen3 ~0.8B model builder
+# ---------------------------------------------------------------------------
+
+_EPS = 1e-6
+_LINEAR_INIT = {"weight": partial(nn.init.trunc_normal_, std=0.02), "bias": nn.init.zeros_}
+_NORM_INIT = {"weight": nn.init.ones_}
+_EMBEDDING_SKIP_INIT = {"weight": skip_param_init}
+
+
+def _output_init(dim: int) -> dict:
+    s = dim ** -0.5
+    return {"weight": partial(nn.init.trunc_normal_, std=s, a=-3 * s, b=3 * s)}
+
+
+def _depth_init(layer_id: int) -> dict:
+    return {"weight": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id))}
+
+
+def _norm(dim: int) -> RMSNorm.Config:
+    return RMSNorm.Config(normalized_shape=dim, eps=_EPS, param_init=_NORM_INIT)
+
+
+def build_qwen3_0_8b(vocab_size: int, seq_len: int) -> Qwen3Model:
+    """Qwen3-style dense model targeting ~0.8B parameters.
+
+    Architecture (matches Qwen3 family conventions):
+      dim=1280, n_layers=32, n_heads=16, n_kv_heads=8, head_dim=128, hidden_dim=4096
+    Parameter count (with weight tying):
+      32 × (attention ~7.9M + FFN ~15.7M) + embeddings (~vocab×1280) ≈ 0.80B @ vocab=32768
+    """
+    dim = 1280
+    head_dim = 128
+    n_heads = 16
+    n_kv_heads = 8
+    hidden_dim = 4096
+    n_layers = 32
+
+    layers = []
+    for layer_id in range(n_layers):
+        layers.append(
+            Qwen3TransformerBlock.Config(
+                attention_norm=_norm(dim),
+                ffn_norm=_norm(dim),
+                attention=make_gqa_config(
+                    dim=dim,
+                    n_heads=n_heads,
+                    n_kv_heads=n_kv_heads,
+                    head_dim=head_dim,
+                    wqkv_param_init=_LINEAR_INIT,
+                    wo_param_init=_depth_init(layer_id),
+                    inner_attention=ScaledDotProductAttention.Config(),
+                    mask_type="causal",
+                    rope_backend="cos_sin",
+                    q_norm=_norm(head_dim),
+                    k_norm=_norm(head_dim),
+                ),
+                feed_forward=make_ffn_config(
+                    dim=dim,
+                    hidden_dim=hidden_dim,
+                    w1_param_init=_LINEAR_INIT,
+                    w2w3_param_init=_depth_init(layer_id),
+                ),
+            )
+        )
+
+    config = Qwen3Model.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        enable_weight_tying=True,
+        norm=_norm(dim),
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_SKIP_INIT,
+        ),
+        output=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_init(dim),
+        ),
+        rope=RoPE.Config(
+            dim=head_dim,
+            max_seq_len=seq_len,
+            theta=1_000_000.0,
+            backend="cos_sin",
+        ),
+        layers=layers,
+    )
+    model = Qwen3Model(config)
+    model.init_states()
+    return model
+
+
+class Qwen3LM(nn.Module):
+    """Thin wrapper giving Qwen3Model the (idx, targets) -> (logits, loss) interface."""
+
+    def __init__(self, vocab_size: int, seq_len: int):
+        super().__init__()
+        self.model = build_qwen3_0_8b(vocab_size, seq_len)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        logits = self.model(idx)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
 
 # ---------------------------------------------------------------------------
@@ -36,12 +160,8 @@ class Config:
     token_dtype: str   = "uint16"
     seq_len:     int   = 1024
 
-    # Model (passed through to get_model — add arch-specific keys in model.py)
-    vocab_size: int   = 32768
-    n_layer:    int   = 12
-    n_head:     int   = 12
-    n_embd:     int   = 768
-    dropout:    float = 0.0
+    # Model — architecture is fixed at Qwen3 ~0.8B; only vocab_size is configurable
+    vocab_size: int = 32768
 
     # Training
     batch_size:       int   = 8
@@ -189,9 +309,6 @@ def main():
     parser.add_argument("--checkpoint_path",   default="checkpoint.pt")
     parser.add_argument("--seq_len",           type=int,   default=1024)
     parser.add_argument("--vocab_size",        type=int,   default=32768)
-    parser.add_argument("--n_layer",           type=int,   default=12)
-    parser.add_argument("--n_head",            type=int,   default=12)
-    parser.add_argument("--n_embd",            type=int,   default=768)
     parser.add_argument("--batch_size",        type=int,   default=8)
     parser.add_argument("--grad_accum_steps",  type=int,   default=4)
     parser.add_argument("--max_steps",         type=int,   default=10_000)
@@ -205,9 +322,6 @@ def main():
         checkpoint_path    = args.checkpoint_path,
         seq_len            = args.seq_len,
         vocab_size         = args.vocab_size,
-        n_layer            = args.n_layer,
-        n_head             = args.n_head,
-        n_embd             = args.n_embd,
         batch_size         = args.batch_size,
         grad_accum_steps   = args.grad_accum_steps,
         max_steps          = args.max_steps,
@@ -232,7 +346,7 @@ def main():
               if "cuda" in device else nullcontext()
 
     # ------------------------------------------------------------------ Model
-    model = get_model(asdict(cfg)).to(device)
+    model = Qwen3LM(cfg.vocab_size, cfg.seq_len).to(device)
     if master:
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[model] {n_params/1e6:.1f}M parameters")

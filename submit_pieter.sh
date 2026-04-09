@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=llm-train
+#SBATCH --job-name=p-train
 #SBATCH --partition=gpus
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -29,11 +29,11 @@ srun python -m torch.distributed.run \
     --rdzv_backend=c10d \
     --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
     --rdzv_id="$SLURM_JOB_ID" \
-    train.py \
+    train_model_design.py \
         --data_dir      /home/data/ \
         --checkpoint_path checkpoint.pt \
         --seq_len       1024 \
-        --batch_size    32 \
+        --batch_size    256 \
         --max_steps        5000 \
         --time_limit_min   10 \
         --wandb_project gpumode

@@ -1,0 +1,33 @@
+{
+  "summary": {
+    "stop_reason": "time_limit",
+    "steps_completed": 283,
+    "elapsed_seconds": 135.8765709400177,
+    "tokens_total": 74186752,
+    "tokens_per_sec_avg": 764739.3552483311,
+    "compute_usage_pct_avg": 37.165203613443005,
+    "mem_peak_reserved_gib_max": 36.740234375,
+    "final_loss": 6.705990672111511,
+    "world_size": 8,
+    "config": {
+      "data_dir": "/home/data/",
+      "token_dtype": "uint16",
+      "seq_len": 1024,
+      "vocab_size": 32768,
+      "n_layer": 32,
+      "n_head": 24,
+      "n_embd": 1536,
+      "dropout": 0.0,
+      "batch_size": 8,
+      "grad_accum_steps": 4,
+      "max_lr": 0.0006,
+      "min_lr": 6e-05,
+      "warmup_steps": 100,
+      "max_steps": 1000000,
+      "weight_decay": 0.1,
+      "grad_clip": 1.0,
+      "time_limit_seconds": 120.0,
+      "checkpoint_path": "experiments/model_scale_20260409_131633/m958.pt"
+    }
+  }
+}

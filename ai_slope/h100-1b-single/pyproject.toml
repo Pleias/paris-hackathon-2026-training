@@ -1,0 +1,29 @@
+[project]
+name = "h100-1b-single"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+dependencies = [
+    # Core
+    "torch>=2.4.0",
+    "numpy>=1.26",
+
+    # FP8 via Transformer Engine (H100 = Hopper, SM_90, CUDA 12)
+    "transformer-engine[pytorch]>=1.7",
+
+    # FlashAttention 2 for H100 (FA4 is Blackwell-only)
+    "flash-attn>=2.6",
+
+    # Logging
+    "wandb>=0.17",
+]
+
+[project.optional-dependencies]
+build = [
+    "ninja",
+    "setuptools",
+]
+
+[tool.uv]
+# Install TE without build isolation so it can find system CUDA headers
+# Usage: uv pip install -e . --no-build-isolation

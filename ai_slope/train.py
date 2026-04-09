@@ -758,7 +758,10 @@ def main():
     train_start       = None   # set at first forward pass
 
     model.train()
-    optimizer.zero_grad()
+    if hasattr(model, 'zero_grad_buffer'):
+        model.zero_grad_buffer()
+    else:
+        optimizer.zero_grad()
 
     # Go/no-go state
     aborted_7b = False
@@ -816,7 +819,10 @@ def main():
                 if is_master:
                     print(f"[warn] NaN/divergence at step {step}, "
                           f"halving LR to {cfg.max_lr:.2e} (attempt {nan_recovery_count})")
-                optimizer.zero_grad(set_to_none=True)
+                if hasattr(model, 'zero_grad_buffer'):
+                    model.zero_grad_buffer()
+                else:
+                    optimizer.zero_grad(set_to_none=True)
                 # Update LR in optimizer
                 for pg in optimizer.param_groups:
                     pg["lr"] = get_lr(step, cfg)
@@ -825,12 +831,23 @@ def main():
                 if is_master:
                     print(f"[warn] NaN persists after 2 recoveries at step {step}, continuing")
 
+        # ---- Copy main_grad → param.grad for MegatronDDP compatibility
+        # MegatronDDP stores gradients in param.main_grad, not param.grad.
+        # Standard PyTorch clip_grad_norm_ and optimizers read param.grad.
+        if dp_size > 1 and hasattr(model, 'zero_grad_buffer'):
+            for p in raw_model.parameters():
+                if hasattr(p, 'main_grad') and p.main_grad is not None:
+                    p.grad = p.main_grad.to(p.dtype)
+
         # ---- Gradient clip + optimizer step
         grad_norm = torch.nn.utils.clip_grad_norm_(
             raw_model.parameters(), cfg.grad_clip
         ).item()
         optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        if hasattr(model, 'zero_grad_buffer'):
+            model.zero_grad_buffer()
+        else:
+            optimizer.zero_grad(set_to_none=True)
 
         step_ms = (time.time() - step_t0) * 1000
         step_times.append(step_ms)

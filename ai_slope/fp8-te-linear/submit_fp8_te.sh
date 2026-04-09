@@ -28,9 +28,12 @@ srun python -m torch.distributed.run \
         --data_dir      /home/data/ \
         --checkpoint_path /home/pleias/yarik-slope/ai_slope/fp8-te-linear/checkpoint.pt \
         --vocab_size    32000 \
+        --n_layer       18 \
+        --n_head        16 \
+        --n_embd        2048 \
         --max_steps     50 \
         --time_limit_min 8 \
         --wandb_project gpumode \
-        --wandb_run_name fp8-te-linear-8gpu
+        --wandb_run_name fp8-te-linear-1b-8gpu
 
 echo "=== DONE ==="

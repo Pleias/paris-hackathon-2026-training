@@ -292,11 +292,11 @@ def main():
 
     if TE_AVAILABLE and "cuda" in device:
         fp8_recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16)
-        fp8_ctx = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
+        fp8_ctx_factory = lambda: te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
         if master:
             print("[fp8] Transformer Engine FP8 enabled (HYBRID format)")
     else:
-        fp8_ctx = nullcontext()
+        fp8_ctx_factory = nullcontext
         if master:
             print("[fp8] TE not available, running in bfloat16 only")
 
@@ -377,7 +377,7 @@ def main():
             sync_ctx = model.no_sync() if (ddp and micro_step < cfg.grad_accum_steps - 1) \
                        else nullcontext()
             t_compute = time.time()
-            with sync_ctx, amp_ctx, fp8_ctx, attn_ctx_factory():
+            with sync_ctx, amp_ctx, fp8_ctx_factory(), attn_ctx_factory():
                 _, loss = model(x, y)
                 loss    = loss / cfg.grad_accum_steps
             loss.backward()

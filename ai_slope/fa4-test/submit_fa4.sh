@@ -31,7 +31,7 @@ srun python -m torch.distributed.run \
         --max_steps     50 \
         --time_limit_min 8 \
         --require_fa4 true \
-        --wandb_project paris-hackathon \
+        --wandb_project gpumode \
         --wandb_run_name fa4-test-8gpu
 
 echo "=== DONE ==="

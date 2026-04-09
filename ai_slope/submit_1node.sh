@@ -48,6 +48,8 @@ srun torchrun \
         --max-steps 20 \
         --micro-batch 4 \
         --global-batch 128 \
-        --max-lr 6e-4
+        --max-lr 6e-4 \
+        --wandb-project gpumode \
+        --wandb-run-name llama7b-fp8-1node
 
 echo "[submit] job $SLURM_JOB_ID complete"

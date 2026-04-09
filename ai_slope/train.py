@@ -23,6 +23,11 @@ import json
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -33,6 +38,7 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 # Megatron-Core parallel state
 # ---------------------------------------------------------------------------
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -152,7 +158,7 @@ class TPAttention(nn.Module):
       - output proj (RowParallel): concat on dim=1 across TP ranks
     """
 
-    def __init__(self, cfg: TrainConfig, tp_size: int):
+    def __init__(self, cfg: TrainConfig, tp_size: int, mp_config: ModelParallelConfig):
         super().__init__()
         self.tp_size     = tp_size
         self.n_heads     = cfg.num_attention_heads
@@ -168,13 +174,16 @@ class TPAttention(nn.Module):
         total_local = (self.n_heads_local + 2 * self.n_kv_heads_local) * self.head_dim
 
         # Fused QKV — ColumnParallelLinear handles the all-gather on output
+        init_method = lambda x: torch.nn.init.normal_(x, std=0.02)
         self.linear_qkv = ColumnParallelLinear(
             cfg.hidden_size, total_local * tp_size,
             bias=False, gather_output=False,
+            config=mp_config, init_method=init_method,
         )
         self.linear_proj = RowParallelLinear(
             self.n_heads * self.head_dim, cfg.hidden_size,
             bias=False, input_is_parallel=True,
+            config=mp_config, init_method=init_method,
         )
 
     def forward(self, x, freqs_cis):
@@ -221,17 +230,20 @@ class TPFeedForward(nn.Module):
       - w2 (down, RowParallel): concat on dim=1 across TP ranks
     """
 
-    def __init__(self, cfg: TrainConfig, tp_size: int):
+    def __init__(self, cfg: TrainConfig, tp_size: int, mp_config: ModelParallelConfig):
         super().__init__()
+        init_method = lambda x: torch.nn.init.normal_(x, std=0.02)
         # Fused gate+up projection (ColumnParallel)
         self.linear_fc1 = ColumnParallelLinear(
             cfg.hidden_size, cfg.intermediate_size * 2,
             bias=False, gather_output=False,
+            config=mp_config, init_method=init_method,
         )
         # Down projection (RowParallel)
         self.linear_fc2 = RowParallelLinear(
             cfg.intermediate_size, cfg.hidden_size,
             bias=False, input_is_parallel=True,
+            config=mp_config, init_method=init_method,
         )
 
     def forward(self, x):
@@ -243,12 +255,12 @@ class TPFeedForward(nn.Module):
 
 
 class TPTransformerBlock(nn.Module):
-    def __init__(self, cfg: TrainConfig, tp_size: int):
+    def __init__(self, cfg: TrainConfig, tp_size: int, mp_config: ModelParallelConfig):
         super().__init__()
         self.attention_norm = RMSNorm(cfg.hidden_size)
-        self.attention      = TPAttention(cfg, tp_size)
+        self.attention      = TPAttention(cfg, tp_size, mp_config)
         self.ffn_norm       = RMSNorm(cfg.hidden_size)
-        self.feed_forward   = TPFeedForward(cfg, tp_size)
+        self.feed_forward   = TPFeedForward(cfg, tp_size, mp_config)
 
     def forward(self, x, freqs_cis):
         x = x + self.attention(self.attention_norm(x), freqs_cis)
@@ -263,15 +275,22 @@ class TPLlamaModel(nn.Module):
         self.tp_size = tp_size
         head_dim     = cfg.hidden_size // cfg.num_attention_heads
 
-        self.tok_embeddings = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
+        mp_config = ModelParallelConfig(tensor_model_parallel_size=tp_size)
+        init_method = lambda x: torch.nn.init.normal_(x, std=0.02)
+
+        self.tok_embeddings = VocabParallelEmbedding(
+            cfg.vocab_size, cfg.hidden_size,
+            init_method=init_method, config=mp_config,
+        )
         self.layers = nn.ModuleList([
-            TPTransformerBlock(cfg, tp_size)
+            TPTransformerBlock(cfg, tp_size, mp_config)
             for _ in range(cfg.num_layers)
         ])
         self.norm   = RMSNorm(cfg.hidden_size)
         self.output = ColumnParallelLinear(
             cfg.hidden_size, cfg.vocab_size,
             bias=False, gather_output=True,
+            config=mp_config, init_method=init_method,
         )
 
         self.register_buffer(
@@ -553,6 +572,8 @@ def parse_args():
     p.add_argument("--max-lr",           type=float, default=6e-4)
     p.add_argument("--no-fp8",           action="store_true")
     p.add_argument("--no-compile",       action="store_true")
+    p.add_argument("--wandb-project",    default=None)
+    p.add_argument("--wandb-run-name",   default=None)
     return p.parse_args()
 
 
@@ -626,6 +647,12 @@ def main():
         print(f"[config] TP={tp_size}, DP={dp_size}, world={world_size}, "
               f"micro_batch={cfg.micro_batch_size}, grad_accum={grad_accum}, "
               f"GBS={cfg.global_batch_size}, use_fp8={cfg.use_fp8}")
+        if wandb is not None and args.wandb_project:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config=asdict(cfg),
+            )
 
     # ------------------------------------------------------------------ Model
     model = TPLlamaModel(cfg, tp_size).to(device)
@@ -702,6 +729,8 @@ def main():
             if metrics_file:
                 metrics_file.write(json.dumps(kwargs) + "\n")
                 metrics_file.flush()
+            if wandb is not None and wandb.run is not None:
+                wandb.log(kwargs, step=kwargs.get("step"))
 
     # ------------------------------------------------------------------ Training state
     step              = 0
@@ -907,6 +936,9 @@ def main():
 
     if metrics_file:
         metrics_file.close()
+
+    if is_master and wandb is not None and wandb.run is not None:
+        wandb.finish()
 
     dist.barrier()
     parallel_state.destroy_model_parallel()

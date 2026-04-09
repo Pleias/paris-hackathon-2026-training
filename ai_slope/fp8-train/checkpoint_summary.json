@@ -1,0 +1,33 @@
+{
+  "summary": {
+    "stop_reason": "max_steps",
+    "steps_completed": 50,
+    "elapsed_seconds": 29.008808851242065,
+    "tokens_total": 13107200,
+    "tokens_per_sec_avg": 1538729.0622753967,
+    "compute_usage_pct_avg": 21.51772928237915,
+    "mem_peak_reserved_gib_max": 6.80859375,
+    "final_loss": 8.37929105758667,
+    "world_size": 8,
+    "config": {
+      "data_dir": "/home/data/",
+      "token_dtype": "uint16",
+      "seq_len": 1024,
+      "vocab_size": 32000,
+      "n_layer": 12,
+      "n_head": 12,
+      "n_embd": 768,
+      "dropout": 0.0,
+      "batch_size": 8,
+      "grad_accum_steps": 4,
+      "max_lr": 0.0006,
+      "min_lr": 6e-05,
+      "warmup_steps": 100,
+      "max_steps": 50,
+      "weight_decay": 0.1,
+      "grad_clip": 1.0,
+      "time_limit_seconds": 480.0,
+      "checkpoint_path": "/home/pleias/yarik-slope/ai_slope/fp8-train/checkpoint.pt"
+    }
+  }
+}

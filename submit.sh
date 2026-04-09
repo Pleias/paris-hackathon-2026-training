@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=llm-train
 #SBATCH --partition=gpus
-#SBATCH --nodes=4
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive

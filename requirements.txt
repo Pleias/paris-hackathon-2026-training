@@ -1,0 +1,4 @@
+numpy>=1.24
+torch>=2.3
+# TorchTitan is required by train_torchtitan.py
+git+https://github.com/pytorch/torchtitan.git

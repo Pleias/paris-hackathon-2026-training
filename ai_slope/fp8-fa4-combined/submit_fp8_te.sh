@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=fp8-te-linear
+#SBATCH --job-name=fp8-fa4-combined
 #SBATCH --partition=gpus
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -24,16 +24,18 @@ srun python -m torch.distributed.run \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     --rdzv_id=$SLURM_JOB_ID \
-    /home/pleias/yarik-slope/ai_slope/fp8-te-linear/train.py \
+    /home/pleias/yarik-slope/ai_slope/fp8-fa4-combined/train.py \
         --data_dir      /home/data/ \
-        --checkpoint_path /home/pleias/yarik-slope/ai_slope/fp8-te-linear/checkpoint.pt \
+        --checkpoint_path /home/pleias/yarik-slope/ai_slope/fp8-fa4-combined/checkpoint.pt \
         --vocab_size    32000 \
         --n_layer       18 \
-        --n_head        16 \
-        --n_embd        2048 \
+        --n_head        32 \
+        --n_embd        4096 \
+        --batch_size    32 \
+        --seq_len       2048 \
         --max_steps     50 \
         --time_limit_min 8 \
         --wandb_project gpumode \
-        --wandb_run_name fp8-te-linear-1b-8gpu
+        --wandb_run_name fp8-fa4-combined-4b-8gpu-bs32-seq2048
 
 echo "=== DONE ==="

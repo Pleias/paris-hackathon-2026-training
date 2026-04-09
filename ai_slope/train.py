@@ -55,7 +55,7 @@ from megatron.core.tensor_parallel import (
 # Transformer Engine FP8 — optional, falls back to BF16
 try:
     import transformer_engine.pytorch as te
-    from transformer_engine.common.recipe import Format, DelayedScaling
+    from transformer_engine.common.recipe import Format, DelayedScaling, Float8CurrentScaling
     TE_AVAILABLE = True
 except ImportError:
     TE_AVAILABLE = False
@@ -324,8 +324,8 @@ class TPLlamaModel(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
             )
             # Reduce loss across TP ranks
             dist.all_reduce(loss, op=dist.ReduceOp.SUM,
@@ -663,16 +663,29 @@ def main():
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[model] {n_params/1e6:.1f}M parameters (local TP shard)")
 
-    # TP ranks share gradients via Megatron-Core; DDP handles DP all-reduce
+    # Use Megatron's DDP — understands TP topology, no shape verification issues
     if dp_size > 1:
-        # Use DDP only across DP dimension — the TP group handles its own comms
-        # We use process_group for data-parallel ranks with matching tp_rank
-        from torch.nn.parallel import DistributedDataParallel as DDP
-        dp_group = dist.new_group([
-            r for r in range(world_size)
-            if r % tp_size == tp_rank   # same TP rank across nodes
-        ])
-        model = DDP(model, device_ids=[local_rank], process_group=dp_group)
+        from megatron.core.distributed import (
+            DistributedDataParallel as MegatronDDP,
+            DistributedDataParallelConfig,
+        )
+        from megatron.core.transformer.transformer_config import TransformerConfig as MegatronTransformerConfig
+        transformer_config = MegatronTransformerConfig(
+            tensor_model_parallel_size=tp_size,
+            num_layers=cfg.num_layers,
+            hidden_size=cfg.hidden_size,
+            num_attention_heads=cfg.num_attention_heads,
+            params_dtype=torch.bfloat16,
+        )
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            overlap_grad_reduce=True,
+        )
+        model = MegatronDDP(
+            config=transformer_config,
+            ddp_config=ddp_config,
+            module=model,
+        )
 
     # torch.compile — applied after DDP wrapping
     if not args.no_compile:
@@ -684,6 +697,7 @@ def main():
             if is_master:
                 print(f"[compile] torch.compile failed ({e}), continuing without")
 
+    # MegatronDDP exposes the inner module via .module; PyTorch DDP does too
     raw_model = model.module if hasattr(model, "module") else model
 
     # ------------------------------------------------------------------ Optimizer
@@ -712,7 +726,7 @@ def main():
 
     # ------------------------------------------------------------------ Precision context
     if cfg.use_fp8:
-        fp8_recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16)
+        fp8_recipe = Float8CurrentScaling(fp8_format=Format.HYBRID)
         def get_amp_ctx():
             return te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
     else:
@@ -788,6 +802,10 @@ def main():
 
             loss.backward()
             accumulated_loss += loss.item()
+
+        # MegatronDDP with overlap_grad_reduce needs explicit sync after last backward
+        if dp_size > 1 and hasattr(model, "finish_grad_sync"):
+            model.finish_grad_sync()
 
         # ---- NaN / divergence detection
         if math.isnan(accumulated_loss) or math.isinf(accumulated_loss) or \

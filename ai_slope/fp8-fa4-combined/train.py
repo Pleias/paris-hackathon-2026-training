@@ -9,6 +9,8 @@ import math
 import json
 import argparse
 import importlib
+import queue
+import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 
@@ -72,9 +74,10 @@ class Config:
 # ---------------------------------------------------------------------------
 
 class BinDataset:
-    """Memory-maps all *.bin files and draws random (seq_len+1)-token windows."""
+    """Memory-maps all *.bin files and draws random (seq_len+1)-token windows.
+    Prefetches batches in a background thread so GPU never waits on CPU data loading."""
 
-    def __init__(self, data_dir: str, seq_len: int, dtype: str = "uint16"):
+    def __init__(self, data_dir: str, seq_len: int, dtype: str = "uint16", prefetch: int = 2):
         paths = sorted(glob.glob(os.path.join(data_dir, "*.bin")))
         if not paths:
             raise FileNotFoundError(f"No *.bin files found in '{data_dir}'")
@@ -86,7 +89,17 @@ class BinDataset:
         self.weights  = [l / self.total for l in self.lengths]
         print(f"[data] {len(paths)} shard(s), {self.total:,} tokens total")
 
-    def get_batch(self, batch_size: int, device):
+        self._device     = None
+        self._batch_size = None
+        self._queue      = queue.Queue(maxsize=prefetch)
+        self._thread     = None
+
+    def _worker(self):
+        while True:
+            item = self._build_batch(self._batch_size)
+            self._queue.put(item)
+
+    def _build_batch(self, batch_size):
         xs, ys = [], []
         for _ in range(batch_size):
             shard = self.shards[np.random.choice(len(self.shards), p=self.weights)]
@@ -94,7 +107,21 @@ class BinDataset:
             chunk = torch.from_numpy(shard[start:start + self.seq_len + 1].astype(np.int64))
             xs.append(chunk[:-1])
             ys.append(chunk[1:])
-        return torch.stack(xs).to(device), torch.stack(ys).to(device)
+        x = torch.stack(xs).pin_memory()
+        y = torch.stack(ys).pin_memory()
+        return x, y
+
+    def start_prefetch(self, batch_size: int, device):
+        self._batch_size = batch_size
+        self._device     = device
+        self._thread     = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def get_batch(self, batch_size: int, device):
+        if self._thread is None:
+            self.start_prefetch(batch_size, device)
+        x, y = self._queue.get()
+        return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 
 # ---------------------------------------------------------------------------

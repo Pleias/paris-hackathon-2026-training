@@ -13,7 +13,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # 1. Activate shared venv
 # ---------------------------------------------------------------------------
-source /home/.venv/bin/activate
+source .venv/bin/activate
 
 # ---------------------------------------------------------------------------
 # 2. Stage data to local NVMe on each node (parallel, idempotent)

@@ -1,9 +1,9 @@
-# PyTorch nightly (2.7+) with CUDA 13.0 / Blackwell support
---index-url https://download.pytorch.org/whl/nightly/cu130
+# Use PyTorch nightly index as extra (not primary) so PyPI packages still resolve
+--extra-index-url https://download.pytorch.org/whl/nightly/cu130
 torch>=2.7.0.dev0
 
-# Megatron-Core for tensor parallelism primitives (not on PyPI, install from GitHub)
-megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@main#subdirectory=megatron/core
+# Megatron-Core for tensor parallelism primitives
+megatron-core>=0.9.0
 
 # Transformer Engine for FP8 on Blackwell B300
 transformer-engine[pytorch]>=1.12.0
@@ -11,5 +11,5 @@ transformer-engine[pytorch]>=1.12.0
 # Numerics / data
 numpy>=1.26.0
 
-# Testing (optional, not needed for training)
+# Testing
 pytest>=8.0.0

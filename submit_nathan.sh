@@ -29,7 +29,7 @@ srun python -m torch.distributed.run \
     --rdzv_backend=c10d \
     --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
     --rdzv_id="$SLURM_JOB_ID" \
-    train_model_design_nathan.py \
+    train_model_design.py \
         --data_dir      /home/data/ \
         --checkpoint_path checkpoint.pt \
         --seq_len       1024 \

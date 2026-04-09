@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=p-train
+#SBATCH --job-name=n-train
 #SBATCH --partition=gpus
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1

@@ -1,0 +1,33 @@
+{
+  "summary": {
+    "stop_reason": "time_limit",
+    "steps_completed": 450,
+    "elapsed_seconds": 126.63867235183716,
+    "tokens_total": 117964800,
+    "tokens_per_sec_avg": 1181550.4183953172,
+    "compute_usage_pct_avg": 30.231708704630535,
+    "mem_peak_reserved_gib_max": 17.478515625,
+    "final_loss": 5.680818200111389,
+    "world_size": 8,
+    "config": {
+      "data_dir": "/home/data/",
+      "token_dtype": "uint16",
+      "seq_len": 1024,
+      "vocab_size": 32768,
+      "n_layer": 22,
+      "n_head": 16,
+      "n_embd": 1152,
+      "dropout": 0.0,
+      "batch_size": 8,
+      "grad_accum_steps": 4,
+      "max_lr": 0.0006,
+      "min_lr": 6e-05,
+      "warmup_steps": 100,
+      "max_steps": 1000000,
+      "weight_decay": 0.1,
+      "grad_clip": 1.0,
+      "time_limit_seconds": 120.0,
+      "checkpoint_path": "experiments/model_scale_20260409_131633/m389.pt"
+    }
+  }
+}

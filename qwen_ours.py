@@ -82,9 +82,9 @@ class Qwen3Model(Decoder):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
-        dim: int = 1024
-        vocab_size: int = 151936
-        enable_weight_tying: bool = False
+        dim: int = 768
+        vocab_size: int = 32_000
+        enable_weight_tying: bool = True
 
         def update_from_config(
             self,

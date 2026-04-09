@@ -18,49 +18,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func
-    HAS_FA4 = True
-except Exception:
-    fa4_flash_attn_func = None
-    HAS_FA4 = False
-
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd, n_head, seq_len, dropout):
+    def __init__(self, n_embd, n_head, n_kv_head, seq_len, dropout):
         super().__init__()
         assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.n_embd = n_embd
-        self.c_attn  = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.c_proj  = nn.Linear(n_embd, n_embd,     bias=False)
+        assert n_head % n_kv_head == 0
+        self.n_head    = n_head
+        self.n_kv_head = n_kv_head
+        self.n_embd    = n_embd
+        self.head_dim  = n_embd // n_head
+        self.q_proj  = nn.Linear(n_embd, n_embd,                        bias=False)
+        self.kv_proj = nn.Linear(n_embd, 2 * n_kv_head * self.head_dim, bias=False)
+        self.c_proj  = nn.Linear(n_embd, n_embd,                        bias=False)
         self.dropout = dropout
 
     def forward(self, x):
         B, T, C = x.shape
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        hd = C // self.n_head
-        q = q.view(B, T, self.n_head, hd)
-        k = k.view(B, T, self.n_head, hd)
-        v = v.view(B, T, self.n_head, hd)
-
-        # Prefer direct FlashAttention-4 kernels when available/applicable.
-        if HAS_FA4 and x.is_cuda and (not self.training or self.dropout == 0.0):
-            y = fa4_flash_attn_func(q, k, v, causal=True)
-        else:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                is_causal=True,
-                dropout_p=self.dropout if self.training else 0.0,
-            )
-            y = y.transpose(1, 2)
-
-        y = y.contiguous().view(B, T, C)
+        q = self.q_proj(x)
+        kv = self.kv_proj(x)
+        k, v = kv.split(self.n_kv_head * self.head_dim, dim=2)
+        q = q.view(B, T, self.n_head,    self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        # expand K/V to match query heads
+        groups = self.n_head // self.n_kv_head
+        k = k.repeat_interleave(groups, dim=1)
+        v = v.repeat_interleave(groups, dim=1)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                           dropout_p=self.dropout if self.training else 0.0)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
 
 
@@ -76,10 +63,10 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, n_embd, n_head, seq_len, dropout):
+    def __init__(self, n_embd, n_head, n_kv_head, seq_len, dropout):
         super().__init__()
         self.ln1  = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, seq_len, dropout)
+        self.attn = CausalSelfAttention(n_embd, n_head, n_kv_head, seq_len, dropout)
         self.ln2  = nn.LayerNorm(n_embd)
         self.mlp  = MLP(n_embd, dropout)
 
@@ -90,14 +77,14 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size, seq_len, n_layer, n_head, n_embd, dropout=0.0):
+    def __init__(self, vocab_size, seq_len, n_layer, n_head, n_kv_head, n_embd, dropout=0.0):
         super().__init__()
         self.seq_len = seq_len
         self.transformer = nn.ModuleDict(dict(
             wte  = nn.Embedding(vocab_size, n_embd),
             wpe  = nn.Embedding(seq_len,    n_embd),
             drop = nn.Dropout(dropout),
-            h    = nn.ModuleList([Block(n_embd, n_head, seq_len, dropout)
+            h    = nn.ModuleList([Block(n_embd, n_head, n_kv_head, seq_len, dropout)
                                   for _ in range(n_layer)]),
             ln_f = nn.LayerNorm(n_embd),
         ))
@@ -152,11 +139,12 @@ def get_model(config: dict) -> nn.Module:
     # ))
 
     return torch.compile(GPT(
-        vocab_size = config.get("vocab_size", 32768),
-        seq_len    = config.get("seq_len",    1024),
-        n_layer    = config.get("n_layer",    12),
-        n_head     = config.get("n_head",     12),
-        n_embd     = config.get("n_embd",     768),
+        vocab_size = config.get("vocab_size", 32000),
+        seq_len    = config.get("seq_len",    512),
+        n_layer    = config.get("n_layer",    18),
+        n_head     = config.get("n_head",     6),
+        n_kv_head  = config.get("n_kv_head",  2),
+        n_embd     = config.get("n_embd",     384),
         dropout    = config.get("dropout",    0.0),
     ))
 

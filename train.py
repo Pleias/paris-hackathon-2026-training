@@ -8,12 +8,14 @@ import glob
 import math
 import json
 import argparse
+import importlib
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 try:
     import wandb
@@ -179,6 +181,57 @@ def save_metrics_reports(cfg: Config, summary: dict):
     print(f"[metrics] saved → {json_path}")
 
 
+def setup_attention_backend(device: str, master: bool, require_fa4: bool):
+    """Configure attention backend and return context manager factory for forward passes."""
+    if "cuda" not in device:
+        if master:
+            print("[attn] CUDA not detected; using default non-flash attention path.")
+        return nullcontext
+
+    flash_attn_version = None
+    try:
+        flash_attn = importlib.import_module("flash_attn")
+        flash_attn_version = getattr(flash_attn, "__version__", None)
+    except Exception:
+        flash_attn_version = None
+
+    if flash_attn_version is None:
+        try:
+            import importlib.metadata as importlib_metadata
+            flash_attn_version = importlib_metadata.version("flash-attn-4")
+        except Exception:
+            flash_attn_version = None
+
+    fa4_available = False
+    if flash_attn_version is not None:
+        try:
+            fa4_available = int(str(flash_attn_version).split(".")[0]) >= 4
+        except Exception:
+            fa4_available = False
+
+    if require_fa4 and not fa4_available:
+        raise RuntimeError(
+            "FlashAttention-4 was requested, but package flash_attn>=4 is not available in this environment. "
+            "Install it first, or run with --require_fa4 false to use PyTorch flash SDPA kernels."
+        )
+
+    # Force PyTorch SDPA flash backend (math and mem-efficient kernels disabled).
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+
+    if master:
+        if fa4_available:
+            print(
+                f"[attn] flash_attn {flash_attn_version} detected (FA4+). "
+                "Model uses direct FA4 kernels when applicable; SDPA flash is forced for fallback paths."
+            )
+        else:
+            print("[attn] flash_attn>=4 not detected. Forcing PyTorch flash SDPA backend.")
+
+    return lambda: sdpa_kernel(SDPBackend.FLASH_ATTENTION)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -196,6 +249,7 @@ def main():
     parser.add_argument("--grad_accum_steps",  type=int,   default=4)
     parser.add_argument("--max_steps",         type=int,   default=10_000)
     parser.add_argument("--time_limit_min",    type=float, default=10.0)
+    parser.add_argument("--require_fa4", type=lambda x: x.lower() in ("1", "true", "yes"), default=False)
     parser.add_argument("--wandb_project", type=str, default=None, help="W&B project name (omit to disable)")
     parser.add_argument("--wandb_run_name", type=str, default=None)
     args = parser.parse_args()
@@ -230,6 +284,7 @@ def main():
     torch.manual_seed(1337 + rank)
     amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) \
               if "cuda" in device else nullcontext()
+    attn_ctx_factory = setup_attention_backend(device=device, master=master, require_fa4=args.require_fa4)
 
     # ------------------------------------------------------------------ Model
     model = get_model(asdict(cfg)).to(device)
@@ -308,7 +363,7 @@ def main():
             sync_ctx = model.no_sync() if (ddp and micro_step < cfg.grad_accum_steps - 1) \
                        else nullcontext()
             t_compute = time.time()
-            with sync_ctx, amp_ctx:
+            with sync_ctx, amp_ctx, attn_ctx_factory():
                 _, loss = model(x, y)
                 loss    = loss / cfg.grad_accum_steps
             loss.backward()
